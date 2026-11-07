@@ -7,5 +7,6 @@ pub mod deploy;
 pub mod has_updates;
 pub mod list_updates;
 pub mod reload;
+pub mod report;
 pub mod status;
 pub mod upgrade;

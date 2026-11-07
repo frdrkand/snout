@@ -208,8 +208,8 @@ programs.snout.reload = {
 
 ## Usage
 
-Eight commands, in three groups. Three ask the daemon a question; one asks it to
-check now; four do work here. All eight require the daemon to be running.
+Nine commands, in three groups. Four ask the daemon a question; one asks it to
+check now; four do work here. All nine require the daemon to be running.
 
 | Command | What it does |
 |---|---|
@@ -220,6 +220,7 @@ check now; four do work here. All eight require the daemon to be running.
 | `snout has-updates` | Print `yes` or `no`. |
 | `snout check` | Ask the daemon to check now, and wait for the answer. |
 | `snout status` | The snout version, the daemon, and what the cache holds. |
+| `snout report --json` | Everything the daemon knows, as one document for an updates window. |
 | `snout reload` | Restart the desktop components a switch leaves stale. |
 
 ### Global options
@@ -229,7 +230,7 @@ check now; four do work here. All eight require the daemon to be running.
 | `--flake PATH` | Override the flake path **for the work this process does**. |
 | `--host NAME` | Override the `nixosConfigurations` attribute, likewise. |
 | `--color auto\|always\|never` | Colourise output. |
-| `--json` | Emit one JSON document on stdout. Accepted by `list-updates`, `has-updates` and `status` only; every other command refuses it rather than ignoring it. |
+| `--json` | Emit one JSON document on stdout. Accepted by `list-updates`, `has-updates`, `status` and `report` only; every other command refuses it rather than ignoring it. |
 
 `--flake` and `--host` affect only `build`, `deploy` and `upgrade`. The daemon
 watches whatever it was configured with, and `snout status` reports which — so
@@ -361,6 +362,24 @@ workstation
 
 snout: start it with 'systemctl --user start snout-daemon'
 ```
+
+### `snout report`
+
+The document a desktop's updates window renders: a headline, what the daemon is
+doing, and the moved inputs and changed packages as two lists, with the words
+already chosen. A read, like `status` and `list-updates`, and built from the
+same two answers.
+
+It exists so a window does not have to know snout. Turning `status --json` into
+a screen means naming the phases, wording the daemon line while it backs off,
+and telling apart five reasons the package list can be empty; a surface that did
+that itself would carry its own copy of snout's vocabulary. The shape is a
+generic one, so a tool that updates something else entirely can produce the
+same document and the same window shows it. See
+[`report --json`](#report---json).
+
+It has no plain form, because `status` and `list-updates` already are one, so it
+requires `--json`.
 
 ### `snout build`
 
@@ -599,6 +618,60 @@ With no daemon, the document is smaller and says only what is known:
 }
 ```
 
+### `report --json`
+
+```json
+{
+  "schemaVersion": 1,
+  "title": "updates available",
+  "count": 87,
+  "available": true,
+  "busy": false,
+  "checkedAt": "2026-08-17T06:14:11+02:00",
+  "startedAt": null,
+  "progress": null,
+  "error": null,
+  "notices": [
+    { "label": "Daemon", "text": "Idle · next check 08:14", "tone": "muted" }
+  ],
+  "parts": [
+    {
+      "id": "inputs", "name": "Flake inputs", "note": "", "apply": "snout upgrade",
+      "checkedAt": "2026-08-17T06:14:11+02:00", "busy": false, "error": null,
+      "message": "Up to date",
+      "updates": [ { "name": "nixpkgs", "from": "0e251e2", "to": "e5bdc4a", "kind": "changed" } ]
+    },
+    {
+      "id": "packages", "name": "Packages",
+      "note": "81 changed, 3 added, 3 removed · closure 23.0 MiB", "apply": "snout upgrade",
+      "checkedAt": "2026-08-17T06:14:11+02:00", "busy": false, "error": null,
+      "message": "Nothing would change — you are on the latest of everything",
+      "updates": [ { "name": "glibc", "from": "2.39", "to": "2.40", "kind": "changed", "sizeDelta": 2201600 } ]
+    }
+  ],
+  "hint": "check now with `snout check` · apply with `snout upgrade`",
+  "about": "snout 0.1.0 (a1b2c3d) · workstation · /etc/nixos"
+}
+```
+
+- **`title`** and **`count`** are the headline: `count` is the packages that
+  would change, and stays 0 until that has been worked out, however many inputs
+  moved. `title` then says which state it is in — `Inputs have moved`,
+  `Not checked yet`, `Up to date`.
+- **`available`**, **`checkedAt`**, **`busy`** and **`error`** are
+  `has-updates --json`'s, with the same filtering: a failed package build is not
+  a headline error, it is the packages part's.
+- **`progress`** is the step a running check is on, as a phrase
+  (`Building the updated system`), and **`startedAt`** when it began.
+- **`notices`** are labelled lines for the window's status panel. `tone` is
+  `normal`, `muted` or `warning`; the format also allows `danger`.
+- **`parts`** are the two lists. `message` is what to show in place of a list
+  that is empty, and `sizeDelta` is present only where a size is known. `from`
+  and `to` are empty, not `∅`, for a package that is only on one side.
+- **`hint`** and **`about`** are the footer and the small print.
+
+With no daemon it is the usual error document, which has no `parts`.
+
 ### The socket
 
 The daemon listens on `$XDG_RUNTIME_DIR/snout/snout.sock`, newline-delimited
@@ -642,12 +715,14 @@ Two surfaces, and they need different things:
   when that was last established, whether a check is running, and whether checks
   have started failing. On a click, **`snout list-updates --quick --json`** says
   which inputs moved, for a tooltip or popup.
-- **The details view** shows the package list, and calls **`snout list-updates
-  --json`** when it opens, with **`snout status --json`** for the daemon, its
-  schedule and the phase of a running check. Safe in an open handler for the
-  same reason: both read what the daemon holds and return at once. A view kept
-  open can poll `status` and re-fetch the list only when `full.checkedAt`
-  changes.
+- **The details view** shows the package list. **`snout report --json`** is
+  the whole of it in one document, already worded: the daemon line, the moved
+  inputs, the packages and what to say while there are none. Or, to word it
+  yourself, call **`snout list-updates --json`** when it opens, with
+  **`snout status --json`** for the daemon, its schedule and the phase of a
+  running check. Any of them is safe in an open handler for the same reason:
+  they read what the daemon holds and return at once. A view kept open can poll
+  `status` and re-fetch the list only when `full.checkedAt` changes.
 
 The bar cannot start work by accident, because none of these commands starts
 work — the daemon decides when to check, and it decided hours ago. `snout check`

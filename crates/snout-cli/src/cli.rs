@@ -1,7 +1,7 @@
 //! The command table, and what every command is handed.
 //!
-//! Eight commands, in three groups. Three of them — `list-updates`,
-//! `has-updates`, `status` — are questions the daemon answers from its cache;
+//! Nine commands, in three groups. Four of them — `list-updates`,
+//! `has-updates`, `status`, `report` — are questions the daemon answers from its cache;
 //! they run in microseconds and start nothing. One, `check`, asks the daemon to
 //! run its own check now and follows it. The other four do real work in this
 //! process, because it is the one with a terminal attached and therefore the
@@ -46,7 +46,7 @@ pub struct Global {
 
     /// Emit one JSON document on stdout
     ///
-    /// Accepted by list-updates, has-updates and status.
+    /// Accepted by list-updates, has-updates, status and report.
     #[arg(long, global = true, action = ArgAction::SetTrue)]
     pub json: bool,
 }
@@ -58,7 +58,7 @@ pub struct Global {
     about = "Simple NixOS Update Tool",
     after_help = "\
 Exit codes: 0 ok, 1 failed, 2 usage, 3 precondition not met.
---json is accepted by: list-updates, has-updates, status.
+--json is accepted by: list-updates, has-updates, status, report.
 
 Every command needs snout-daemon running; it owns the update cache."
 )]
@@ -86,6 +86,13 @@ pub enum Command {
     Check(commands::check::Options),
     /// Report the snout version, the daemon, and what the cache holds
     Status,
+    /// Everything the daemon knows, as one JSON document for an updates window
+    ///
+    /// The document a desktop's updates window renders: a headline, the
+    /// daemon's state, and the moved inputs and changed packages as two lists,
+    /// already worded. Requires --json; in a terminal, use status and
+    /// list-updates.
+    Report,
     /// Restart the desktop components a switch leaves stale
     Reload,
     /// Print a shell completion script
@@ -105,7 +112,7 @@ impl Command {
     fn speaks_json(&self) -> bool {
         matches!(
             self,
-            Command::ListUpdates(_) | Command::HasUpdates | Command::Status
+            Command::ListUpdates(_) | Command::HasUpdates | Command::Status | Command::Report
         )
     }
 
@@ -124,6 +131,7 @@ impl Command {
             Command::HasUpdates => "has-updates",
             Command::Check(_) => "check",
             Command::Status => "status",
+            Command::Report => "report",
             Command::Reload => "reload",
             Command::Completion(_) => "completion",
         }
@@ -244,7 +252,7 @@ fn report_parse_error(e: clap::Error, wants_json: bool, out: &Stream, err: &Stre
 async fn dispatch(cli: Cli, ui: Ui, runner: Runner) -> Result<()> {
     if cli.global.json && !cli.command.speaks_json() {
         return Err(Error::usage(format!(
-            "{} does not produce JSON — --json is accepted by: list-updates, has-updates, status",
+            "{} does not produce JSON — --json is accepted by: list-updates, has-updates, status, report",
             cli.command.name()
         )));
     }
@@ -283,6 +291,7 @@ async fn dispatch(cli: Cli, ui: Ui, runner: Runner) -> Result<()> {
         Command::HasUpdates => commands::has_updates::run(&app).await,
         Command::Check(o) => commands::check::run(&app, &o).await,
         Command::Status => commands::status::run(&app).await,
+        Command::Report => commands::report::run(&app).await,
         Command::Reload => commands::reload::run(&app).await,
         Command::Completion(o) => commands::completion::run(&app, &o),
     }

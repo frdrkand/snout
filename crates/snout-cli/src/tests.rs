@@ -376,7 +376,7 @@ fn warm_moved() -> MovedDoc {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn help_lists_the_eight_commands_and_hides_completion() {
+async fn help_lists_the_nine_commands_and_hides_completion() {
     let _g = guard();
     let h = Harness::new();
     assert_eq!(h.run(&["--help"]).await, EXIT_OK);
@@ -389,6 +389,7 @@ async fn help_lists_the_eight_commands_and_hides_completion() {
         "has-updates",
         "check",
         "status",
+        "report",
         "reload",
     ] {
         assert!(out.contains(name), "{name} missing from help:\n{out}");
@@ -744,6 +745,180 @@ async fn status_names_the_step_a_running_check_is_on() {
 }
 
 // ---------------------------------------------------------------------------
+// report
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn report_requires_json() {
+    // It has no plain form: status and list-updates already are one.
+    let _g = guard();
+    let h = Harness::new().with_cache(warm_status(), warm_updates(), warm_moved());
+    assert_eq!(h.run(&["report"]).await, EXIT_USAGE);
+    assert!(h.stderr().contains("report --json"), "{}", h.stderr());
+    assert!(h.asked().is_empty(), "asked the daemon anyway");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn report_refuses_when_the_daemon_is_absent_and_says_so_as_json() {
+    let _g = guard();
+    let h = Harness::new();
+    assert_eq!(h.run(&["report", "--json"]).await, EXIT_PRECONDITION);
+    let v = h.json();
+    assert_eq!(v["error"]["code"], "precondition");
+    // No parts: a consumer tells "nothing is watching" from "nothing to do" by
+    // their absence, not by an empty list.
+    assert!(v.get("parts").is_none(), "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn report_reads_and_never_checks() {
+    let _g = guard();
+    let h = Harness::new().with_cache(warm_status(), warm_updates(), warm_moved());
+    assert_eq!(h.run(&["report", "--json"]).await, EXIT_OK);
+    assert_eq!(h.asked(), vec![Request::Status, Request::ListUpdates]);
+    assert!(h.fake().calls().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn report_carries_the_inputs_and_the_packages_as_two_parts() {
+    let _g = guard();
+    let h = Harness::new().with_cache(warm_status(), warm_updates(), warm_moved());
+    assert_eq!(h.run(&["report", "--json"]).await, EXIT_OK);
+    let v = h.json();
+    assert_eq!(v["schemaVersion"], 1);
+    assert_eq!(v["title"], "updates available");
+    assert_eq!(v["count"], 2);
+    assert_eq!(v["available"], true);
+    assert_eq!(v["busy"], false);
+    assert!(v["progress"].is_null());
+    assert!(v["error"].is_null());
+    assert_eq!(v["notices"][0]["label"], "Daemon");
+    assert!(
+        v["notices"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Idle · next check "),
+        "{v}"
+    );
+    assert!(v["about"].as_str().unwrap().contains("1.2.3 (abc1234)"));
+
+    let inputs = &v["parts"][0];
+    assert_eq!(inputs["id"], "inputs");
+    assert_eq!(inputs["apply"], "snout upgrade");
+    assert_eq!(inputs["updates"][0]["name"], "nixpkgs");
+    assert_eq!(inputs["updates"][0]["from"], "0e251e2");
+    assert_eq!(inputs["updates"][0]["kind"], "changed");
+    // An input has no size, and saying 0 would be a claim.
+    assert!(inputs["updates"][0].get("sizeDelta").is_none(), "{inputs}");
+
+    let packages = &v["parts"][1];
+    assert_eq!(packages["id"], "packages");
+    assert_eq!(packages["updates"][0]["sizeDelta"], 8_999_900);
+    // diff-closures' "absent" marker reads as a blank: the kind says added.
+    assert_eq!(packages["updates"][1]["from"], "");
+    assert_eq!(packages["updates"][1]["kind"], "added");
+    assert!(
+        packages["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 changed, 1 added, 0 removed · closure "),
+        "{packages}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_report_says_never_checked_rather_than_up_to_date() {
+    let _g = guard();
+    let h = Harness::new().with_cold_cache();
+    assert_eq!(h.run(&["report", "--json"]).await, EXIT_OK);
+    let v = h.json();
+    assert_eq!(v["title"], "Not checked yet");
+    assert_eq!(v["count"], 0);
+    assert!(v["checkedAt"].is_null());
+    assert_eq!(v["parts"][0]["message"], "Never checked");
+    assert!(v["parts"][0]["checkedAt"].is_null());
+    assert!(
+        v["parts"][1]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Never checked"),
+        "{v}"
+    );
+    // Empty lists, never null.
+    assert_eq!(v["parts"][1]["updates"], serde_json::json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_report_while_building_names_the_step_on_the_packages_part() {
+    let _g = guard();
+    let mut st = warm_status();
+    st.full = FullStatus::default();
+    st.daemon.busy = true;
+    st.daemon.phase = Some(Phase::Building);
+    st.daemon.started_at = Some(now());
+    let h = Harness::new().with_cache(st, UpdatesDoc::empty(), warm_moved());
+    assert_eq!(h.run(&["report", "--json"]).await, EXIT_OK);
+    let v = h.json();
+    assert_eq!(v["busy"], true);
+    assert_eq!(v["progress"], "Building the updated system");
+    assert!(v["startedAt"].is_string());
+    assert_eq!(v["title"], "Inputs have moved");
+    assert_eq!(v["parts"][0]["busy"], false);
+    assert_eq!(v["parts"][1]["busy"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_build_lands_on_the_packages_part_not_the_headline() {
+    // The same rule as has-updates: the inputs were compared, so checking is
+    // not failing; the package-level question is the one without an answer.
+    let _g = guard();
+    let mut st = warm_status();
+    st.full = FullStatus::default();
+    st.error = Some(ErrorDoc {
+        code: Code::Build,
+        message: "builder failed".into(),
+    });
+    let h = Harness::new().with_cache(st, UpdatesDoc::empty(), warm_moved());
+    assert_eq!(h.run(&["report", "--json"]).await, EXIT_OK);
+    let v = h.json();
+    assert!(v["error"].is_null(), "{v}");
+    assert!(v["parts"][0]["error"].is_null(), "{v}");
+    assert_eq!(v["parts"][1]["error"]["code"], "build");
+    assert!(
+        v["parts"][1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to build"),
+        "{v}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_check_is_on_the_headline_and_the_inputs() {
+    let _g = guard();
+    let mut st = warm_status();
+    st.error = Some(ErrorDoc {
+        code: Code::Network,
+        message: "timed out".into(),
+    });
+    st.daemon.backoff_until = Some(now() + chrono::TimeDelta::minutes(5));
+    let h = Harness::new().with_cache(st, warm_updates(), warm_moved());
+    assert_eq!(h.run(&["report", "--json"]).await, EXIT_OK);
+    let v = h.json();
+    assert_eq!(v["error"]["code"], "network");
+    assert_eq!(v["parts"][0]["error"]["code"], "network");
+    assert!(v["parts"][1]["error"].is_null(), "{v}");
+    assert_eq!(v["notices"][0]["tone"], "warning");
+    assert!(
+        v["notices"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Retrying at "),
+        "{v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // check
 // ---------------------------------------------------------------------------
 
@@ -1040,6 +1215,7 @@ async fn completion_scripts_name_every_command() {
         "has-updates",
         "check",
         "status",
+        "report",
     ] {
         assert!(out.contains(name), "{name} missing from completions");
     }
