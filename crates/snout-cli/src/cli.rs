@@ -1,14 +1,16 @@
 //! The command table, and what every command is handed.
 //!
-//! Seven commands, in two groups. Three of them — `list-updates`,
+//! Eight commands, in three groups. Three of them — `list-updates`,
 //! `has-updates`, `status` — are questions the daemon answers from its cache;
-//! they run in microseconds and start nothing. The other four do real work in
-//! this process, because it is the one with a terminal attached and therefore
-//! the only one `sudo` can prompt on.
+//! they run in microseconds and start nothing. One, `check`, asks the daemon to
+//! run its own check now and follows it. The other four do real work in this
+//! process, because it is the one with a terminal attached and therefore the
+//! only one `sudo` can prompt on.
 //!
-//! Both groups require a daemon. The first cannot answer without one; the
-//! second must be able to tell one that the system changed, or the cache is
-//! left describing a machine that no longer exists.
+//! All of them require a daemon. The questions cannot be answered without one,
+//! `check` is a request to it, and the work must be able to tell it that the
+//! system changed, or the cache is left describing a machine that no longer
+//! exists.
 
 use std::ffi::OsString;
 
@@ -80,6 +82,8 @@ pub enum Command {
     ListUpdates(commands::list_updates::Options),
     /// Print yes or no, depending on whether updates are available
     HasUpdates,
+    /// Ask the daemon to check for updates now, and wait for the answer
+    Check(commands::check::Options),
     /// Report the snout version, the daemon, and what the cache holds
     Status,
     /// Restart the desktop components a switch leaves stale
@@ -118,6 +122,7 @@ impl Command {
             Command::Upgrade(_) => "upgrade",
             Command::ListUpdates(_) => "list-updates",
             Command::HasUpdates => "has-updates",
+            Command::Check(_) => "check",
             Command::Status => "status",
             Command::Reload => "reload",
             Command::Completion(_) => "completion",
@@ -276,6 +281,7 @@ async fn dispatch(cli: Cli, ui: Ui, runner: Runner) -> Result<()> {
         Command::Upgrade(o) => commands::upgrade::run(&app, &o).await,
         Command::ListUpdates(o) => commands::list_updates::run(&app, &o).await,
         Command::HasUpdates => commands::has_updates::run(&app).await,
+        Command::Check(o) => commands::check::run(&app, &o).await,
         Command::Status => commands::status::run(&app).await,
         Command::Reload => commands::reload::run(&app).await,
         Command::Completion(o) => commands::completion::run(&app, &o),

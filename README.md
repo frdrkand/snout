@@ -208,8 +208,8 @@ programs.snout.reload = {
 
 ## Usage
 
-Seven commands, in two groups. Three ask the daemon a question; four do work
-here. All seven require the daemon to be running.
+Eight commands, in three groups. Three ask the daemon a question; one asks it to
+check now; four do work here. All eight require the daemon to be running.
 
 | Command | What it does |
 |---|---|
@@ -218,6 +218,7 @@ here. All seven require the daemon to be running.
 | `snout upgrade` | Update the flake inputs, then build and activate. |
 | `snout list-updates` | Print the updates the daemon has found. |
 | `snout has-updates` | Print `yes` or `no`. |
+| `snout check` | Ask the daemon to check now, and wait for the answer. |
 | `snout status` | The snout version, the daemon, and what the cache holds. |
 | `snout reload` | Restart the desktop components a switch leaves stale. |
 
@@ -285,6 +286,39 @@ whose daemon has not got to the package diff yet still says `yes`.
 
 Finding updates is not a failure, so this never encodes its answer in the exit
 status.
+
+Under `--json` it also says whether the answer was ever established, whether a
+check is running, and whether checking is failing — everything a status-bar
+indicator shows, in one small document. See
+[`has-updates --json`](#has-updates---json).
+
+### `snout check`
+
+```console
+$ snout check
+snout: updating inputs
+snout: building the updated system
+snout: comparing closures
+snout: 2 inputs moved
+snout: 87 updates (81 changed, 3 added, 3 removed) — see 'snout list-updates'
+```
+
+Brings the daemon's scheduled check forward and follows it to the answer. The
+daemon still runs it — this is the same check the schedule would have run, under
+the same lock, into the same cache — so a status bar sees it like any other.
+
+Two differences from a scheduled check, both because asking by hand is a request
+to try again: it ignores a running backoff, and it retries a lock whose build
+already failed, which the schedule deliberately skips. Unlike the invalidation
+`deploy` sends, it keeps the cache: the answers on disk stay true until this
+check replaces them.
+
+If a check is already running, it follows that one rather than queueing a
+second. `--no-wait` returns once the daemon has the request. Interrupting the
+wait does not stop the check; the daemon carries on with it.
+
+A check that fails exits with the code the daemon recorded — 1 for a failed
+fetch or build — as though the work had happened here.
 
 ### `snout status`
 
@@ -402,8 +436,8 @@ to it. At `debug` it also forwards nix's own output, which on a cold nixpkgs is
 thousands of lines.
 
 It sleeps until the next check is due and wakes for nothing else: one check once
-`settleDelay` is up, then one per `interval`. A deploy or an `invalidate` wakes
-it early. Note what the timer is measured against — a suspend does not advance
+`settleDelay` is up, then one per `interval`. A deploy, an `invalidate` or a
+`snout check` wakes it early. Note what the timer is measured against — a suspend does not advance
 it, so a laptop that slept through the interval checks that much later than the
 wall clock says it was due.
 
@@ -483,8 +517,24 @@ case to handle, not two.
 ### `has-updates --json`
 
 ```json
-{ "schemaVersion": 1, "available": true }
+{
+  "schemaVersion": 1,
+  "available": true,
+  "checkedAt": "2026-08-17T06:14:11+02:00",
+  "busy": false,
+  "error": null
+}
 ```
+
+The document a status-bar indicator polls. `checkedAt` is `null` until the
+inputs have been compared once, which is what tells "nothing moved" apart from
+"nothing checked yet" — `available` is `false` for both. `busy` is true while a
+check runs or is about to.
+
+`error` is `status`'s, minus failures with code `build`. A failed package build
+leaves this answer standing — the inputs were compared perfectly well — so an
+indicator that turned red for it would be reporting a problem with a different
+question. `status` still carries it.
 
 ### `status --json`
 
@@ -498,7 +548,9 @@ case to handle, not two.
     "running": true,
     "busy": false,
     "nextCheckAt": "2026-08-17T08:14:11+02:00",
-    "backoffUntil": null
+    "backoffUntil": null,
+    "phase": null,
+    "startedAt": null
   },
   "quick": {
     "checkedAt": "2026-08-17T06:14:11+02:00",
@@ -529,6 +581,12 @@ can say: a failed check never overwrites a good one, so both go on describing
 the last time things worked. Without it a surface could sit on a week-old answer
 with no way to tell.
 
+While a check runs, `daemon.phase` names the step it is on — `waiting` (for
+another check's lock), `copying`, `updating`, `building`, `comparing` — and
+`daemon.startedAt` says when it began, so a surface can show elapsed time
+without polling for it. Both are `null` when idle. `phase` can also be briefly
+`null` while `busy` is true, between a check being requested and it starting.
+
 With no daemon, the document is smaller and says only what is known:
 
 ```json
@@ -551,10 +609,12 @@ $ printf '{"method":"status"}\n' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/snout/s
 {"type":"status","schemaVersion":1,"version":"0.1.0 (a1b2c3d)", …}
 ```
 
-Four methods: `status`, `list-updates`, `list-moved`, and `invalidate` — the
-last being how `deploy` and `upgrade` tell the daemon its cache describes a
-world that has stopped existing. `invalidate` drops the cache and checks again
-at once, which also makes it the way to force a check by hand.
+Five methods: `status`, `list-updates`, `list-moved`, `invalidate` and `check`.
+`invalidate` is how `deploy` and `upgrade` tell the daemon its cache describes a
+world that has stopped existing: it drops the cache and checks again at once.
+`check` is what `snout check` sends: it checks at once and keeps the cache,
+replying `{"type":"check","started":true}`, or `false` when a check was already
+running. Neither waits for the check itself.
 
 Prefer the commands. The socket path, the framing and the reply shapes are
 snout's business, and a consumer that hard-codes all three fails silently the
@@ -577,16 +637,22 @@ after login and the backoff after a failure; a bar polls and displays.
 Two surfaces, and they need different things:
 
 - **The indicator** answers one question — is there anything to update? — so it
-  polls **`snout status --json`**. It never initiates work, so polling is free,
-  and it carries everything an indicator shows: whether the inputs moved, when
-  that was last established, whether a check is running, and whether checks have
-  started failing.
+  polls **`snout has-updates --json`**. It never initiates work, so polling is
+  free, and it carries everything an indicator shows: whether the inputs moved,
+  when that was last established, whether a check is running, and whether checks
+  have started failing. On a click, **`snout list-updates --quick --json`** says
+  which inputs moved, for a tooltip or popup.
 - **The details view** shows the package list, and calls **`snout list-updates
-  --json`** when it opens. Safe in an open handler for the same reason: it reads
-  the daemon's cache and returns at once.
+  --json`** when it opens, with **`snout status --json`** for the daemon, its
+  schedule and the phase of a running check. Safe in an open handler for the
+  same reason: both read what the daemon holds and return at once. A view kept
+  open can poll `status` and re-fetch the list only when `full.checkedAt`
+  changes.
 
-The bar cannot start work by accident, because there is no command that starts
-work — the daemon decides when to check, and it decided hours ago.
+The bar cannot start work by accident, because none of these commands starts
+work — the daemon decides when to check, and it decided hours ago. `snout check`
+is the one command that brings a check forward, and it belongs in a terminal,
+not behind a button you can click by mistake.
 
 A polled indicator, in QML:
 
@@ -600,20 +666,22 @@ Item {
   property bool available: false
   property bool busy: false
   property double checkedAt: 0
+  property bool failed: false
 
   Process {
-    id: statusProc
-    command: ["snout", "status", "--json"]
+    id: proc
+    command: ["snout", "has-updates", "--json"]
     stdout: StdioCollector {
       id: out
       onStreamFinished: {
         try {
-          const s = JSON.parse(out.text);
-          // With no daemon there is no `quick` at all, which is the point:
-          // "nothing is watching" is a different state from "nothing moved".
-          root.available = s.quick ? s.quick.available === true : false;
-          root.busy      = s.daemon.busy === true;
-          root.checkedAt = s.quick && s.quick.checkedAt ? Date.parse(s.quick.checkedAt) : 0;
+          const d = JSON.parse(out.text);
+          // With no daemon the document is an error and nothing else, which is
+          // the point: "nothing is watching" is not the same as "nothing moved".
+          root.failed    = !!d.error;
+          root.available = d.available === true;
+          root.busy      = d.busy === true;
+          root.checkedAt = d.checkedAt ? Date.parse(d.checkedAt) : 0;
         } catch (e) { /* a partial read; the next tick fixes it */ }
       }
     }
@@ -624,7 +692,7 @@ Item {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: if (!statusProc.running) statusProc.running = true
+    onTriggered: if (!proc.running) proc.running = true
   }
 }
 ```

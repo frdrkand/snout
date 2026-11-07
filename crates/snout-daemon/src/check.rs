@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use snout_common::config::Config;
-use snout_common::docs::{CURRENT_SYSTEM_LINK, Full, Quick, SCHEMA_VERSION};
+use snout_common::docs::{CURRENT_SYSTEM_LINK, Full, Phase, Quick, SCHEMA_VERSION};
 use snout_common::fail::{Code, Context, Error, Result};
 use snout_common::lockdiff;
 use snout_common::nix;
@@ -42,6 +42,9 @@ use crate::store::{Store, SystemProbe};
 /// A clock, injectable so the whole decision tree is testable without waiting.
 pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
+/// Told which step a check has reached, so `status` can say more than "busy".
+pub type Progress = Arc<dyn Fn(Phase) + Send + Sync>;
+
 /// Runs a check and publishes what it found.
 pub struct Checker {
     pub cfg: Config,
@@ -50,6 +53,7 @@ pub struct Checker {
     pub now: Clock,
     pub current_system: SystemProbe,
     pub log: Logger,
+    pub progress: Progress,
 }
 
 impl Checker {
@@ -62,11 +66,16 @@ impl Checker {
             now: Arc::new(clock_now),
             current_system,
             log,
+            progress: Arc::new(|_| {}),
         }
     }
 
     fn now(&self) -> Timestamp {
         (self.now)()
+    }
+
+    fn phase(&self, p: Phase) {
+        (self.progress)(p);
     }
 
     fn probe_system(&self) -> Result<String> {
@@ -88,6 +97,7 @@ impl Checker {
         self.store.ensure()?;
 
         let _lock = self.store.acquire(|| {
+            self.phase(Phase::Waiting);
             self.log.debug("waiting for another check to finish");
         })?;
 
@@ -155,6 +165,7 @@ impl Checker {
         _cancel: &CancellationToken,
         current: &str,
     ) -> Result<(Quick, String)> {
+        self.phase(Phase::Copying);
         self.log.debug("copying the flake");
         self.copy_flake().await?;
 
@@ -164,6 +175,7 @@ impl Checker {
         let before =
             std::fs::read(&lock_path).context(Code::Config, "the flake has no flake.lock")?;
 
+        self.phase(Phase::Updating);
         self.log.debug("updating inputs");
         let cmd = Cmd::new(["nix", "flake", "update", "--flake", &work.to_string_lossy()]);
         let mut filter = nix::LogFilter::default();
@@ -208,6 +220,7 @@ impl Checker {
         let work = self.store.work_path();
         let attr = self.cfg.toplevel_attr(&work.to_string_lossy());
 
+        self.phase(Phase::Building);
         self.log.info("building the updated system");
         let cmd = Cmd::new([
             "nix",
@@ -227,6 +240,7 @@ impl Checker {
         let built = std::fs::canonicalize(self.store.result_link())
             .context(Code::Internal, "resolving the build result")?;
 
+        self.phase(Phase::Comparing);
         self.log.debug("comparing closures");
         let diff = nix::diff_paths(&self.runner, current, &built.to_string_lossy())
             .await
@@ -516,6 +530,34 @@ mod tests {
         assert_eq!(q.moved_count, 1);
         assert_eq!(h.full().unwrap().summary.count, 1);
         assert_eq!(h.fake().count_calls("nix build"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_phases_are_reported_in_the_order_they_run() {
+        let mut h = harness(true);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        h.checker.progress = Arc::new(move |p| s.lock().unwrap().push(p));
+        h.run().await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                Phase::Copying,
+                Phase::Updating,
+                Phase::Building,
+                Phase::Comparing
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_that_stops_at_the_cheap_answer_never_reports_building() {
+        let mut h = harness(false);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = Arc::clone(&seen);
+        h.checker.progress = Arc::new(move |p| s.lock().unwrap().push(p));
+        h.run().await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![Phase::Copying, Phase::Updating]);
     }
 
     #[tokio::test]

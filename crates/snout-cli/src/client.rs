@@ -95,6 +95,15 @@ impl Client {
             other => Err(other.into_error()),
         }
     }
+
+    /// Asks the daemon to check now. True if that started a check, false if
+    /// one was already running.
+    pub async fn check(&self) -> Result<bool> {
+        match self.call(&Request::Check).await? {
+            Reply::Check { started } => Ok(started),
+            other => Err(other.into_error()),
+        }
+    }
 }
 
 /// Exit 3, "precondition not met" — the daemon not running is a state of the

@@ -8,7 +8,10 @@
 //!
 //! What crosses it is deliberately small: everything the CLI can ask is a
 //! question about what the daemon already knows, plus one statement of fact
-//! ([`Request::Invalidate`]) about a system that has just changed underneath it.
+//! ([`Request::Invalidate`]) about a system that has just changed underneath it,
+//! and one request ([`Request::Check`]) to run the schedule's check now. Neither
+//! of the last two waits for the check: the reply says it was arranged, and
+//! `status` is how anyone follows it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -40,6 +43,13 @@ pub enum Request {
     /// answers describing a world that has stopped existing, and waiting out a
     /// whole interval would advertise an update that is already installed.
     Invalidate,
+    /// "Check now" — the scheduled check, brought forward, keeping the cache.
+    ///
+    /// Unlike [`Request::Invalidate`] nothing is dropped: the answers on disk
+    /// are still true until the new check replaces them. It also forgets that
+    /// the current lock failed to build, because asking by hand is exactly a
+    /// request to try again.
+    Check,
 }
 
 /// One line from server to client.
@@ -49,6 +59,12 @@ pub enum Reply {
     Status(Box<Status>),
     Updates(UpdatesDoc),
     Moved(MovedDoc),
+    /// The answer to [`Request::Check`]. `started` is false when a check was
+    /// already running, in which case that one is the answer and no second
+    /// one is queued behind it.
+    Check {
+        started: bool,
+    },
     Ok,
     Error(ErrorDoc),
 }
@@ -162,6 +178,18 @@ mod tests {
             serde_json::to_value(Request::Invalidate).unwrap(),
             serde_json::json!({"method": "invalidate"})
         );
+        assert_eq!(
+            serde_json::to_value(Request::Check).unwrap(),
+            serde_json::json!({"method": "check"})
+        );
+    }
+
+    #[test]
+    fn a_check_reply_says_whether_it_started_one() {
+        assert_eq!(
+            serde_json::to_value(Reply::Check { started: true }).unwrap(),
+            serde_json::json!({"type": "check", "started": true})
+        );
     }
 
     #[test]
@@ -176,6 +204,7 @@ mod tests {
             Request::ListUpdates,
             Request::ListMoved,
             Request::Invalidate,
+            Request::Check,
         ] {
             let s = serde_json::to_string(&r).unwrap();
             assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);

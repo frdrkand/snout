@@ -10,6 +10,7 @@ use snout_common::fail::Result;
 use snout_common::version;
 
 use crate::cli::App;
+use crate::ui::format::ago;
 use crate::ui::{GLYPH_ERROR, GLYPH_OK, clock, now, size, when};
 
 /// The width of the label column — the longest label plus a space, so every
@@ -103,7 +104,13 @@ fn print(app: &App, st: &Status) {
 
     let mut daemon = ui.green("running");
     if st.daemon.busy {
-        daemon.push_str(&ui.dim("  checking now"));
+        let step = st.daemon.phase.map_or("checking now", |p| p.describe());
+        let since = st
+            .daemon
+            .started_at
+            .map(|t| format!(", started {}", ago(Some(t), now)))
+            .unwrap_or_default();
+        daemon.push_str(&ui.dim(&format!("  {step}{since}")));
     } else if let Some(next) = st.daemon.next_check_at {
         daemon.push_str(&ui.dim(&format!("  next check {}", clock(next))));
     }

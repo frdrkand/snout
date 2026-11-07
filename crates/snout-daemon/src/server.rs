@@ -1,9 +1,11 @@
 //! The control socket.
 //!
-//! Four questions and one statement, each answered in a single line. There is
-//! nothing to stream, because nothing the CLI can ask takes longer than a file
-//! read — the daemon is never asked to *start* work, only what it already
-//! knows, and once ([`Request::Invalidate`]) told that what it knows is wrong.
+//! Three questions, one statement and one request, each answered in a single
+//! line. There is nothing to stream, because nothing the CLI can ask takes
+//! longer than a file read. The two that lead to work — [`Request::Invalidate`]
+//! ("what you know is wrong") and [`Request::Check`] ("check now") — only arm
+//! the tick loop and return; the check itself runs on the daemon's own time,
+//! and `status` is how anyone follows it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -144,9 +146,9 @@ async fn handle(daemon: Arc<Daemon>, conn: UnixStream, cancel: CancellationToken
 
 /// The whole request table.
 ///
-/// Every arm is a read of state the daemon already holds, except `Invalidate`,
-/// which is a write that finishes in microseconds. Nothing here can block, so
-/// no handler can hold up a shutdown.
+/// Every arm is a read of state the daemon already holds, except `Invalidate`
+/// and `Check`, which are writes that finish in microseconds. Nothing here can
+/// block, so no handler can hold up a shutdown.
 fn answer(daemon: &Daemon, req: Request) -> Reply {
     match req {
         Request::Status => Reply::Status(Box::new(daemon.status())),
@@ -173,6 +175,10 @@ fn answer(daemon: &Daemon, req: Request) -> Reply {
         Request::Invalidate => match daemon.invalidate() {
             Ok(()) => Reply::Ok,
             Err(e) => Reply::Error(ErrorDoc::from(&e)),
+        },
+
+        Request::Check => Reply::Check {
+            started: daemon.request_check(),
         },
     }
 }
@@ -380,6 +386,23 @@ mod tests {
             s.call(Request::ListUpdates).await,
             Reply::Updates(UpdatesDoc::empty())
         );
+        s.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_request_arms_a_check_and_keeps_the_cache() {
+        let mut s = serve_one().await;
+        s.write_full(RUNNING);
+
+        assert_eq!(s.call(Request::Check).await, Reply::Check { started: true });
+        match s.call(Request::Status).await {
+            Reply::Status(st) => assert!(st.daemon.busy, "the owed check is not busy"),
+            other => panic!("{other:?}"),
+        }
+        match s.call(Request::ListUpdates).await {
+            Reply::Updates(d) => assert_eq!(d.summary.count, 35),
+            other => panic!("{other:?}"),
+        }
         s.shutdown().await;
     }
 

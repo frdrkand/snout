@@ -1,6 +1,7 @@
 //! One module per command, each carrying whatever that command alone needs.
 
 pub mod build;
+pub mod check;
 pub mod completion;
 pub mod deploy;
 pub mod has_updates;

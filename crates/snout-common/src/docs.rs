@@ -161,11 +161,57 @@ impl From<Option<Quick>> for MovedDoc {
 }
 
 /// What `has-updates` prints under `--json`.
+///
+/// Small enough to poll from a status bar, and complete enough that the bar
+/// needs nothing else: whether the inputs moved, whether that has ever been
+/// established, whether a check is running, and whether checking is failing.
+/// `available: false` alone would read the same for "nothing moved" and
+/// "nothing checked yet", which is an answer nobody gave.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AvailableDoc {
     pub schema_version: u32,
     pub available: bool,
+    /// When the inputs were last compared; `null` if they never have been.
+    pub checked_at: Option<Timestamp>,
+    /// A check is running, or is owed and about to start.
+    pub busy: bool,
+    /// Checking is failing in a way that bears on *this* answer. A failed
+    /// package build does not: the inputs were compared perfectly well, and
+    /// the build belongs to the package-level question.
+    pub error: Option<ErrorDoc>,
+}
+
+/// What the daemon is doing while a check runs.
+///
+/// Coarse on purpose — one value per step a person would recognise, not per
+/// subprocess — so a surface can name it without a lookup table that drifts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Phase {
+    /// Another check holds the lock.
+    Waiting,
+    /// Copying the flake's tracked files into the scratch directory.
+    Copying,
+    /// `nix flake update` on the copy. Network.
+    Updating,
+    /// Building the updated system. Minutes, and possibly gigabytes.
+    Building,
+    /// Diffing the built closure against the running one.
+    Comparing,
+}
+
+impl Phase {
+    /// How the step reads in a sentence: "snout: building the updated system".
+    pub fn describe(self) -> &'static str {
+        match self {
+            Phase::Waiting => "waiting for another check",
+            Phase::Copying => "copying the flake",
+            Phase::Updating => "updating inputs",
+            Phase::Building => "building the updated system",
+            Phase::Comparing => "comparing closures",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -202,11 +248,17 @@ pub struct Status {
 #[serde(rename_all = "camelCase")]
 pub struct DaemonStatus {
     pub running: bool,
-    /// True while a check is in flight, which is why a status taken now might
-    /// differ from one taken in a minute.
+    /// True while a check is in flight or owed and about to start, which is
+    /// why a status taken now might differ from one taken in a minute.
     pub busy: bool,
     pub next_check_at: Option<Timestamp>,
     pub backoff_until: Option<Timestamp>,
+    /// The step the running check is on; `null` when idle, and briefly `null`
+    /// while busy, between a check being owed and it starting.
+    pub phase: Option<Phase>,
+    /// When the running check started; `null` when idle. A surface derives
+    /// the elapsed time from this rather than polling for it.
+    pub started_at: Option<Timestamp>,
 }
 
 /// Carries the moved-input list, which is small and is what an indicator shows

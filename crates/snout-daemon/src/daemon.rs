@@ -10,15 +10,15 @@
 //! look. A tool that tells you about updates you did not ask about is a tool
 //! you end up muting.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use snout_common::config::Config;
-use snout_common::docs::Status;
+use snout_common::docs::{Phase, Status};
 use snout_common::fail::{Error, Result};
 use snout_common::run::Runner;
 use snout_common::time::{Timestamp, clock, now as clock_now};
@@ -40,12 +40,22 @@ pub struct Daemon {
     /// True while a check is running, so a status call can say why the answer
     /// it just gave might be different in a minute.
     busy: AtomicBool,
-    /// Set by [`Daemon::invalidate`]: check on the next pass whatever the
-    /// schedule says, because the world the cache described has changed.
+    /// Set by [`Daemon::invalidate`] and [`Daemon::request_check`]: check on
+    /// the next pass whatever the schedule says.
     forced: AtomicBool,
     /// Wakes the tick loop early, so an invalidation is acted on in
     /// milliseconds rather than whenever the schedule next comes round.
     wake: Notify,
+    /// When the running check started and the step it is on. Shared with the
+    /// checker, which is the only thing that knows when a step changes.
+    progress: Arc<Mutex<Running>>,
+}
+
+/// What `status` reports about a check in flight. Both empty when idle.
+#[derive(Debug, Default, Clone, Copy)]
+struct Running {
+    started_at: Option<Timestamp>,
+    phase: Option<Phase>,
 }
 
 impl Daemon {
@@ -82,6 +92,7 @@ impl Daemon {
             busy: AtomicBool::new(false),
             forced: AtomicBool::new(false),
             wake: Notify::new(),
+            progress: Arc::new(Mutex::new(Running::default())),
         }
     }
 
@@ -115,6 +126,12 @@ impl Daemon {
             self.log.clone(),
         );
         c.now = Arc::clone(&self.now);
+        let progress = Arc::clone(&self.progress);
+        c.progress = Arc::new(move |p| {
+            if let Ok(mut r) = progress.lock() {
+                r.phase = Some(p);
+            }
+        });
         c
     }
 
@@ -167,8 +184,16 @@ impl Daemon {
             // An invalidation is consumed whether or not the schedule agrees:
             // the caller has told us the cache describes a world that no longer
             // exists, and the settle delay is about login, not about that.
-            if self.forced.swap(false, Ordering::SeqCst) || self.due() {
+            //
+            // `busy` goes up before `forced` comes down. `status` reports busy
+            // as either, so this order leaves no instant in which a requested
+            // check looks finished before it has started — which is what
+            // `snout check` waits on.
+            if self.forced.load(Ordering::SeqCst) || self.due() {
+                self.busy.store(true, Ordering::SeqCst);
+                self.forced.store(false, Ordering::SeqCst);
                 self.check(cancel).await;
+                self.busy.store(false, Ordering::SeqCst);
             }
         }
     }
@@ -188,10 +213,42 @@ impl Daemon {
 
     /// Runs one check and records what it did.
     async fn check(&self, cancel: &CancellationToken) {
-        self.busy.store(true, Ordering::SeqCst);
+        self.set_running(Running {
+            started_at: Some(self.now()),
+            phase: None,
+        });
         let outcome = self.checker().run(cancel).await;
-        self.busy.store(false, Ordering::SeqCst);
+        self.set_running(Running::default());
         self.record(outcome.as_ref().err());
+    }
+
+    fn set_running(&self, r: Running) {
+        if let Ok(mut cur) = self.progress.lock() {
+            *cur = r;
+        }
+    }
+
+    fn running(&self) -> Running {
+        self.progress.lock().map(|r| *r).unwrap_or_default()
+    }
+
+    /// Brings the scheduled check forward, keeping the cache.
+    ///
+    /// Returns false when a check is already running: that one is the answer
+    /// the caller is after, and queueing a second behind it would only repeat
+    /// it. Otherwise this forgets the lock that last failed to build — asking
+    /// by hand is a request to try again, and a check that then skipped the
+    /// build would not be the one that was asked for. The backoff needs no
+    /// such help: a forced pass does not consult it.
+    pub fn request_check(&self) -> bool {
+        if self.busy.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.store.clear_failed_lock();
+        self.forced.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+        self.log.info("check requested");
+        true
     }
 
     /// Drops the cached answers and checks again at once.
@@ -328,9 +385,14 @@ impl Daemon {
             .snapshot(&self.cfg.host, &self.cfg.flake, current.as_deref());
 
         st.daemon.running = true;
-        st.daemon.busy = self.busy.load(Ordering::SeqCst);
+        // An owed check counts: between a request and the loop picking it up,
+        // "not busy" would tell a waiting `snout check` it had already finished.
+        st.daemon.busy = self.busy.load(Ordering::SeqCst) || self.forced.load(Ordering::SeqCst);
         st.daemon.next_check_at = Some(self.next_check_at());
         st.daemon.backoff_until = self.store.read_state().backoff_until;
+        let r = self.running();
+        st.daemon.phase = r.phase;
+        st.daemon.started_at = r.started_at;
         st
     }
 }
@@ -616,6 +678,73 @@ mod tests {
         assert!(st.daemon.running);
         assert!(st.daemon.next_check_at.is_some());
         assert!(!st.daemon.busy);
+    }
+
+    #[test]
+    fn an_idle_status_has_no_phase_and_no_start_time() {
+        let h = harness();
+        let st = h.daemon.status();
+        assert!(st.daemon.phase.is_none());
+        assert!(st.daemon.started_at.is_none());
+    }
+
+    #[test]
+    fn a_running_check_reports_its_phase_and_when_it_started() {
+        let h = harness();
+        let at = h.daemon.now();
+        h.daemon.set_running(Running {
+            started_at: Some(at),
+            phase: None,
+        });
+        // The checker the daemon builds is wired to the same progress cell.
+        (h.daemon.checker().progress)(Phase::Building);
+
+        let st = h.daemon.status();
+        assert_eq!(st.daemon.phase, Some(Phase::Building));
+        assert_eq!(st.daemon.started_at, Some(at));
+    }
+
+    // -- request_check -----------------------------------------------------
+
+    #[test]
+    fn a_requested_check_is_armed_keeps_the_cache_and_forgets_a_failed_build() {
+        let h = harness();
+        h.daemon
+            .store
+            .publish(&h.daemon.store.quick_path(), &quick_at(h.daemon.now()), "")
+            .unwrap();
+        h.daemon.store.set_failed_lock("abc");
+
+        assert!(h.daemon.request_check());
+
+        assert!(h.daemon.forced.load(Ordering::SeqCst));
+        // Unlike invalidate, the answer on disk is still true until replaced.
+        assert!(h.daemon.store.read_quick().is_some());
+        assert_eq!(h.daemon.store.failed_lock(), "");
+    }
+
+    #[test]
+    fn an_owed_check_already_reads_as_busy() {
+        // `snout check` waits for busy to clear. If the request alone did not
+        // set it, the first status after asking would say "done".
+        let h = harness();
+        assert!(!h.daemon.status().daemon.busy);
+        h.daemon.request_check();
+        assert!(h.daemon.status().daemon.busy);
+    }
+
+    #[test]
+    fn a_check_requested_while_one_runs_attaches_to_it() {
+        let h = harness();
+        h.daemon.busy.store(true, Ordering::SeqCst);
+        h.daemon.store.set_failed_lock("abc");
+
+        assert!(!h.daemon.request_check());
+        assert!(
+            !h.daemon.forced.load(Ordering::SeqCst),
+            "queued a second check"
+        );
+        assert_eq!(h.daemon.store.failed_lock(), "abc");
     }
 
     #[test]

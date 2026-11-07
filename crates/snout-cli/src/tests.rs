@@ -26,10 +26,10 @@ use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 
 use snout_common::docs::{
-    DaemonStatus, Full, FullStatus, MovedDoc, Quick, QuickStatus, SCHEMA_VERSION, Status,
-    UpdatesDoc,
+    DaemonStatus, ErrorDoc, Full, FullStatus, MovedDoc, Phase, Quick, QuickStatus, SCHEMA_VERSION,
+    Status, UpdatesDoc,
 };
-use snout_common::fail::{EXIT_FAILED, EXIT_OK, EXIT_PRECONDITION, EXIT_USAGE};
+use snout_common::fail::{Code, EXIT_FAILED, EXIT_OK, EXIT_PRECONDITION, EXIT_USAGE};
 use snout_common::lockdiff::Moved;
 use snout_common::nix::{Change, Kind, Summary};
 use snout_common::proto::{self, Reply, Request, socket_path};
@@ -169,6 +169,7 @@ impl Harness {
             Request::ListUpdates => Reply::Updates(updates.clone()),
             Request::ListMoved => Reply::Moved(moved.clone()),
             Request::Invalidate => Reply::Ok,
+            Request::Check => Reply::Check { started: true },
         })
     }
 
@@ -284,6 +285,8 @@ fn status() -> Status {
             busy: false,
             next_check_at: Some(now() + chrono::TimeDelta::hours(1)),
             backoff_until: None,
+            phase: None,
+            started_at: None,
         },
         quick: QuickStatus::default(),
         full: FullStatus::default(),
@@ -373,7 +376,7 @@ fn warm_moved() -> MovedDoc {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn help_lists_the_seven_commands_and_hides_completion() {
+async fn help_lists_the_eight_commands_and_hides_completion() {
     let _g = guard();
     let h = Harness::new();
     assert_eq!(h.run(&["--help"]).await, EXIT_OK);
@@ -384,6 +387,7 @@ async fn help_lists_the_seven_commands_and_hides_completion() {
         "upgrade",
         "list-updates",
         "has-updates",
+        "check",
         "status",
         "reload",
     ] {
@@ -399,7 +403,9 @@ async fn the_commands_that_no_longer_exist_are_usage_errors() {
     // They were real commands until this split; a stale muscle-memory
     // invocation should say so rather than doing something surprising.
     let _g = guard();
-    for gone in ["diff", "check", "rollback", "debug", "version", "update"] {
+    // `check` is not in this list: it came back, as a request to the daemon
+    // rather than a check run in this process.
+    for gone in ["diff", "rollback", "debug", "version", "update"] {
         let h = Harness::new();
         assert_eq!(h.run(&[gone]).await, EXIT_USAGE, "{gone} still runs");
     }
@@ -408,7 +414,7 @@ async fn the_commands_that_no_longer_exist_are_usage_errors() {
 #[tokio::test(flavor = "multi_thread")]
 async fn json_is_refused_by_the_commands_that_cannot_produce_it() {
     let _g = guard();
-    for cmd in ["build", "deploy", "upgrade", "reload"] {
+    for cmd in ["build", "deploy", "upgrade", "reload", "check"] {
         let h = Harness::new();
         assert_eq!(h.run(&[cmd, "--json"]).await, EXIT_USAGE, "{cmd}");
         // Reported *as* JSON, because --json was asked for: stdout carries one
@@ -501,6 +507,7 @@ async fn every_command_but_status_refuses_when_the_daemon_is_absent() {
         "upgrade",
         "list-updates",
         "has-updates",
+        "check",
         "reload",
     ] {
         let h = Harness::new();
@@ -642,14 +649,181 @@ async fn has_updates_never_encodes_its_answer_in_the_exit_status() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn has_updates_json_is_a_two_field_object() {
+async fn has_updates_json_carries_what_an_indicator_needs() {
     let _g = guard();
     let h = Harness::new().with_cache(warm_status(), warm_updates(), warm_moved());
     assert_eq!(h.run(&["has-updates", "--json"]).await, EXIT_OK);
+    let v = h.json();
+    let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
     assert_eq!(
-        h.json(),
-        serde_json::json!({"schemaVersion": 1, "available": true})
+        keys,
+        ["available", "busy", "checkedAt", "error", "schemaVersion"]
     );
+    assert_eq!(v["available"], true);
+    assert!(v["checkedAt"].is_string());
+    assert_eq!(v["busy"], false);
+    assert!(v["error"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn has_updates_json_says_never_checked_rather_than_no() {
+    // `available: false` alone reads the same for "nothing moved" and "nothing
+    // checked yet". The null checkedAt is what tells them apart.
+    let _g = guard();
+    let h = Harness::new().with_cold_cache();
+    assert_eq!(h.run(&["has-updates", "--json"]).await, EXIT_OK);
+    let v = h.json();
+    assert_eq!(v["available"], false);
+    assert!(v["checkedAt"].is_null(), "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn has_updates_json_reports_a_running_check() {
+    let _g = guard();
+    let mut st = warm_status();
+    st.daemon.busy = true;
+    let h = Harness::new().with_cache(st, warm_updates(), warm_moved());
+    assert_eq!(h.run(&["has-updates", "--json"]).await, EXIT_OK);
+    assert_eq!(h.json()["busy"], true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn has_updates_json_reports_failing_checks_but_not_failing_builds() {
+    // A failed fetch means the answer is going stale; a failed package build
+    // leaves "have the inputs moved" answered perfectly well.
+    let _g = guard();
+    let failing = |code: Code| {
+        let mut st = warm_status();
+        st.error = Some(ErrorDoc {
+            code,
+            message: "boom".into(),
+        });
+        st
+    };
+
+    let h = Harness::new().with_cache(failing(Code::Network), warm_updates(), warm_moved());
+    assert_eq!(h.run(&["has-updates", "--json"]).await, EXIT_OK);
+    assert_eq!(h.json()["error"]["code"], "network");
+
+    let h = Harness::new().with_cache(failing(Code::Build), warm_updates(), warm_moved());
+    assert_eq!(h.run(&["has-updates", "--json"]).await, EXIT_OK);
+    assert!(h.json()["error"].is_null(), "{}", h.json());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_json_carries_the_phase_of_a_running_check() {
+    let _g = guard();
+    let mut st = warm_status();
+    st.daemon.busy = true;
+    st.daemon.phase = Some(Phase::Building);
+    st.daemon.started_at = Some(now());
+    let h = Harness::new().with_cache(st, warm_updates(), warm_moved());
+    assert_eq!(h.run(&["status", "--json"]).await, EXIT_OK);
+    let v = h.json();
+    assert_eq!(v["daemon"]["phase"], "building");
+    assert!(v["daemon"]["startedAt"].is_string());
+
+    let h = Harness::new().with_cache(warm_status(), warm_updates(), warm_moved());
+    assert_eq!(h.run(&["status"]).await, EXIT_OK);
+    assert!(!h.stdout().contains("building"), "{}", h.stdout());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_names_the_step_a_running_check_is_on() {
+    let _g = guard();
+    let mut st = warm_status();
+    st.daemon.busy = true;
+    st.daemon.phase = Some(Phase::Building);
+    st.daemon.started_at = Some(now());
+    let h = Harness::new().with_cache(st, warm_updates(), warm_moved());
+    assert_eq!(h.run(&["status"]).await, EXIT_OK);
+    let out = h.stdout();
+    assert!(out.contains("building the updated system"), "{out}");
+    assert!(out.contains("started just now"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// check
+// ---------------------------------------------------------------------------
+
+/// A daemon whose status reports a check in progress for the first `busy_for`
+/// polls, then the given final status.
+fn checking(busy_for: usize, done: Status) -> impl Fn(&Request) -> Reply + Send + Sync + 'static {
+    let polls = std::sync::atomic::AtomicUsize::new(0);
+    move |req| match req {
+        Request::Check => Reply::Check { started: true },
+        Request::Status => {
+            let n = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < busy_for {
+                let mut st = done.clone();
+                st.daemon.busy = true;
+                st.daemon.phase = Some(if n == 0 {
+                    Phase::Updating
+                } else {
+                    Phase::Building
+                });
+                st.daemon.started_at = Some(now());
+                st.error = None;
+                Reply::Status(Box::new(st))
+            } else {
+                Reply::Status(Box::new(done.clone()))
+            }
+        }
+        other => panic!("check asked an unexpected question: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn check_asks_the_daemon_then_follows_it_to_the_answer() {
+    let _g = guard();
+    let h = Harness::new().with_daemon(checking(2, warm_status()));
+    assert_eq!(h.run(&["check"]).await, EXIT_OK);
+
+    assert_eq!(h.asked()[0], Request::Check);
+    let out = h.stdout() + &h.stderr();
+    assert!(out.contains("updating inputs"), "{out}");
+    assert!(out.contains("building the updated system"), "{out}");
+    assert!(out.contains("1 input moved"), "{out}");
+    assert!(out.contains("2 updates"), "{out}");
+    // The daemon did the work; nothing ran here.
+    assert!(h.fake().calls().is_empty(), "{:?}", h.fake().calls());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn check_no_wait_returns_once_the_request_is_in() {
+    let _g = guard();
+    let h = Harness::new().with_daemon(checking(1000, warm_status()));
+    assert_eq!(h.run(&["check", "--no-wait"]).await, EXIT_OK);
+    assert_eq!(h.asked(), vec![Request::Check]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_check_exits_with_the_code_the_daemon_recorded() {
+    // As if the work had happened here: a failed fetch exits 1.
+    let _g = guard();
+    let mut done = warm_status();
+    done.error = Some(ErrorDoc {
+        code: Code::Network,
+        message: "updating flake inputs: unable to download".into(),
+    });
+    let h = Harness::new().with_daemon(checking(1, done));
+    assert_eq!(h.run(&["check"]).await, EXIT_FAILED);
+    assert!(h.stderr().contains("unable to download"), "{}", h.stderr());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn check_says_so_when_nothing_moved() {
+    let _g = guard();
+    let mut done = status();
+    done.quick = QuickStatus {
+        checked_at: Some(now()),
+        ..Default::default()
+    };
+    let h = Harness::new().with_daemon(checking(0, done));
+    assert_eq!(h.run(&["check"]).await, EXIT_OK);
+    let out = h.stdout() + &h.stderr();
+    assert!(out.contains("inputs up to date"), "{out}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -864,6 +1038,7 @@ async fn completion_scripts_name_every_command() {
         "upgrade",
         "list-updates",
         "has-updates",
+        "check",
         "status",
     ] {
         assert!(out.contains(name), "{name} missing from completions");
