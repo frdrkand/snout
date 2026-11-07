@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/snout-common",
+    "crates/snout-daemon",
+    "crates/snout-cli",
+]
+
+# One place for everything the crates share, so the two binaries cannot drift on
+# a dependency version and then disagree about the shape of a document that
+# travels between them.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+homepage = "https://github.com/frdrkand/snout"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+snout-common = { path = "crates/snout-common" }
+
+# Command tables, flag parsing, help and validation. Both binaries.
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+clap_complete = "4.5"
+
+# Every JSON document: the config file, the cached answers, the socket wire.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+tokio = { version = "1.44", default-features = false }
+tokio-util = "0.7"
+
+# RFC3339 in the cached documents, local time in `status`.
+chrono = { version = "0.4", features = ["serde", "clock"] }
+
+# Duration strings in the config: "1h", "5m".
+humantime = "2.1"
+
+# The lock hash that decides whether a cached package diff still applies.
+sha2 = "0.10"
+hex = "0.4"
+
+# flock on the cache lock, socket mode, uid, uname.
+rustix = { version = "1.0", features = ["fs", "process", "system", "thread"] }
+
+# Scratch flakes, caches and work trees, built and torn down per test.
+tempfile = "3.10"
+
+[profile.release]
+strip = true
+lto = "thin"

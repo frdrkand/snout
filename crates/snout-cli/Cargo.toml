@@ -1,0 +1,36 @@
+[package]
+name = "snout-cli"
+description = "Simple NixOS Update Tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The crate names the half of the system it is; the binary names what you type.
+[[bin]]
+name = "snout"
+path = "src/main.rs"
+
+# No Store and no Checker reachable from here: the daemon owns the cache, and
+# the crate graph is what enforces it.
+[dependencies]
+snout-common.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "process",
+    "time",
+    "signal",
+    "io-util",
+] }
+
+[dev-dependencies]
+chrono.workspace = true
+tempfile.workspace = true

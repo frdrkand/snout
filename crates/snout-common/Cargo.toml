@@ -1,0 +1,34 @@
+[package]
+name = "snout-common"
+description = "What the snout CLI and the snout daemon both need"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "snout_common"
+path = "src/lib.rs"
+
+# Deliberately no clap and no full tokio: this crate holds the settings, the
+# documents, the wire protocol and the subprocess runner. Anything that decides
+# *policy* — when to check, what to print — belongs to one of the binaries.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+humantime.workspace = true
+rustix.workspace = true
+tokio = { workspace = true, features = [
+    "process",
+    "io-util",
+    "io-std",
+    "rt",
+    "macros",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
